@@ -1,6 +1,7 @@
 # bytes-rc
 
-todo
+A single-threaded, `Rc`-based alternative to the `Bytes` type from the
+`bytes` crate. Implements `Buf` trait from the `bytes` crate.
 
 ## License
 
