@@ -1,7 +1,7 @@
 [package]
 name        = "bytes-rc"
 description = "Rc version of bytes::Bytes"
-version     = "1.0.0"
+version     = "1.1.0"
 edition     = "2024"
 authors     = [ "loncothad <me@loncothad.cc>" ]
 license     = "MIT OR Apache-2.0"
