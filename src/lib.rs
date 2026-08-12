@@ -8,9 +8,37 @@
 //! The types provided here implement [`bytes::Buf`] and [`bytes::BufMut`],
 //! allowing them to be seamlessly integrated with ecosystems that expect buffer
 //! types.
+//!
+//! `Bytes` and `BytesMut` intentionally do not implement `Send` or `Sync`. Use
+//! the `bytes` crate when a buffer must cross thread boundaries.
+//!
+//! # Example
+//!
+//! ```
+//! use bytes_rc::{
+//!     BytesMut,
+//!     buf::{
+//!         Buf,
+//!         BufMut,
+//!     },
+//! };
+//!
+//! let mut buffer = BytesMut::with_capacity(32);
+//! buffer.put_slice(b"hello world");
+//!
+//! let mut bytes = buffer.freeze();
+//! bytes.advance(6);
+//! assert_eq!(&bytes[..], b"world");
+//! ```
+//!
+//! The single-threaded guarantee is enforced by the type system:
+//!
+//! ```compile_fail
+//! fn require_send<T: Send>() {}
+//! require_send::<bytes_rc::Bytes>();
+//! ```
 
 #![deny(missing_docs)]
-#![allow(clippy::all)]
 
 use core::{
     alloc::Layout,
@@ -74,12 +102,18 @@ struct Vtable {
     drop:  fn(&mut Bytes),
 }
 
+#[inline]
+fn allocation_layout(capacity: usize) -> Layout {
+    Layout::array::<u8>(capacity).expect("capacity overflow")
+}
+
 static SHARED_VTABLE: Vtable = Vtable {
     clone: |b| {
         if !b.data.is_null() {
+            // SAFETY: the shared vtable is installed only with a live
+            // `SharedData` allocation in `data`.
             unsafe {
-                let cnt = (*b.data).ref_cnt.get();
-                (*b.data).ref_cnt.set(cnt + 1);
+                increment_ref_count(&(*b.data).ref_cnt);
             }
         }
         Bytes {
@@ -91,12 +125,15 @@ static SHARED_VTABLE: Vtable = Vtable {
     },
     drop:  |b| {
         if !b.data.is_null() {
+            // SAFETY: the shared vtable owns one reference to the live control
+            // block, and the last reference owns its byte allocation.
             unsafe {
                 let shared = b.data;
                 let cnt = (*shared).ref_cnt.get();
+                debug_assert!(cnt > 0, "reference count underflow");
                 if cnt == 1 {
                     if (*shared).alloc_cap > 0 {
-                        let layout = Layout::from_size_align_unchecked((*shared).alloc_cap, 1);
+                        let layout = allocation_layout((*shared).alloc_cap);
                         std::alloc::dealloc((*shared).alloc_ptr.as_ptr(), layout);
                     }
                     drop(Box::from_raw(shared));
@@ -122,15 +159,31 @@ static STATIC_VTABLE: Vtable = Vtable {
 
 struct OwnerData<T> {
     ref_cnt: Cell<usize>,
-    #[allow(unused)]
     owner:   T,
+}
+
+impl<T> OwnerData<T> {
+    const VTABLE: Vtable = Vtable {
+        clone: clone_owner::<T>,
+        drop:  drop_owner::<T>,
+    };
+}
+
+#[inline]
+fn increment_ref_count(ref_cnt: &Cell<usize>) {
+    let count = ref_cnt.get();
+    assert!(count > 0 && count <= usize::MAX >> 1, "invalid reference count");
+    ref_cnt.set(count + 1);
 }
 
 fn drop_owner<T>(b: &mut Bytes) {
     if !b.data.is_null() {
+        // SAFETY: this function is used only by `OwnerData<T>::VTABLE`, so the
+        // erased pointer has exactly this type and owns one reference.
         unsafe {
             let shared = b.data as *mut OwnerData<T>;
             let cnt = (*shared).ref_cnt.get();
+            debug_assert!(cnt > 0, "reference count underflow");
             if cnt == 1 {
                 drop(Box::from_raw(shared));
             } else {
@@ -142,10 +195,11 @@ fn drop_owner<T>(b: &mut Bytes) {
 
 fn clone_owner<T>(b: &Bytes) -> Bytes {
     if !b.data.is_null() {
+        // SAFETY: this function is used only by `OwnerData<T>::VTABLE`, so the
+        // erased pointer has exactly this type and remains live.
         unsafe {
             let shared = b.data as *mut OwnerData<T>;
-            let cnt = (*shared).ref_cnt.get();
-            (*shared).ref_cnt.set(cnt + 1);
+            increment_ref_count(&(*shared).ref_cnt);
         }
     }
     Bytes {
@@ -198,30 +252,36 @@ impl Bytes {
 
     /// Creates a new `Bytes` from an arbitrary owner type that implements
     /// `AsRef<[u8]>`.
+    ///
+    /// The owner is kept at a stable address and dropped after the final clone
+    /// or slice derived from this value. Converting owner-backed bytes into
+    /// [`BytesMut`] always copies the visible bytes.
     #[must_use]
     pub fn from_owner<T>(owner: T) -> Self
     where
         T: AsRef<[u8]> + 'static,
     {
-        let slice = owner.as_ref();
-        let ptr = slice.as_ptr();
-        let len = slice.len();
-
-        let data = Box::new(OwnerData {
+        let data = Box::into_raw(Box::new(OwnerData {
             ref_cnt: Cell::new(1),
-            owner:   owner,
-        });
-        let vtable = Box::leak(Box::new(Vtable {
-            clone: clone_owner::<T>,
-            drop:  drop_owner::<T>,
+            owner,
         }));
 
-        Self {
-            ptr,
-            len,
-            data: Box::into_raw(data) as *mut SharedData,
-            vtable,
-        }
+        // Build the guard first so a panicking `AsRef` still drops the owner.
+        let mut bytes = Self {
+            ptr:    NonNull::dangling().as_ptr(),
+            len:    0,
+            data:   data.cast(),
+            vtable: &OwnerData::<T>::VTABLE,
+        };
+
+        // The owner must be placed at its final address before borrowing it. An
+        // `AsRef` implementation may return a slice into the owner itself.
+        // SAFETY: `data` came from `Box::into_raw`, and `bytes` now guards it
+        // against both normal return and unwinding.
+        let slice = unsafe { (*data).owner.as_ref() };
+        bytes.ptr = slice.as_ptr();
+        bytes.len = slice.len();
+        bytes
     }
 
     /// Returns the number of bytes contained in this `Bytes`.
@@ -245,17 +305,21 @@ impl Bytes {
         self.ptr
     }
 
-    /// Returns a slice of self for the provided range.
+    /// Returns a slice of self for the provided range without copying.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range is out of bounds or its start exceeds its end.
     #[must_use]
     pub fn slice(&self, range: impl RangeBounds<usize>) -> Self {
         let len = self.len();
         let start = match range.start_bound() {
             | Bound::Included(&n) => n,
-            | Bound::Excluded(&n) => n.saturating_add(1),
+            | Bound::Excluded(&n) => n.checked_add(1).expect("range start overflow"),
             | Bound::Unbounded => 0,
         };
         let end = match range.end_bound() {
-            | Bound::Included(&n) => n.saturating_add(1),
+            | Bound::Included(&n) => n.checked_add(1).expect("range end overflow"),
             | Bound::Excluded(&n) => n,
             | Bound::Unbounded => len,
         };
@@ -268,33 +332,36 @@ impl Bytes {
         }
 
         let mut ret = self.clone();
+        // SAFETY: the validated start is within this slice's allocation.
         ret.ptr = unsafe { ret.ptr.add(start) };
         ret.len = end - start;
         ret
     }
 
     /// Creates a new `Bytes` from a subslice of this `Bytes`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a non-empty `subset` is not contained in this byte view.
     #[must_use]
     pub fn slice_ref(&self, subset: &[u8]) -> Self {
         if subset.is_empty() {
             return Self::new();
         }
 
-        let self_ptr = self.as_ptr() as usize;
-        let self_len = self.len();
-        let subset_ptr = subset.as_ptr() as usize;
-        let subset_len = subset.len();
+        let offset = (subset.as_ptr() as usize)
+            .checked_sub(self.as_ptr() as usize)
+            .filter(|&offset| offset <= self.len() && subset.len() <= self.len() - offset)
+            .expect("subset is out of bounds or not part of this allocation");
 
-        assert!(
-            subset_ptr >= self_ptr && subset_ptr + subset_len <= self_ptr + self_len,
-            "subset is out of bounds or not part of this allocation"
-        );
-
-        let offset = subset_ptr - self_ptr;
-        self.slice(offset .. (offset + subset_len))
+        self.slice(offset .. offset + subset.len())
     }
 
     /// Splits the buffer into two at the given index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `at` exceeds the buffer length.
     #[must_use = "consider Bytes::truncate if you don't need the other half"]
     pub fn split_off(&mut self, at: usize) -> Self {
         assert!(at <= self.len(), "split_off out of bounds: {} <= {}", at, self.len());
@@ -308,6 +375,7 @@ impl Bytes {
         }
 
         let mut ret = self.clone();
+        // SAFETY: `at` was validated against the current slice length.
         ret.ptr = unsafe { ret.ptr.add(at) };
         ret.len = self.len - at;
         self.len = at;
@@ -315,6 +383,10 @@ impl Bytes {
     }
 
     /// Splits the buffer into two at the given index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `at` exceeds the buffer length.
     #[must_use = "consider Bytes::advance if you don't need the other half"]
     pub fn split_to(&mut self, at: usize) -> Self {
         assert!(at <= self.len(), "split_to out of bounds: {} <= {}", at, self.len());
@@ -329,6 +401,7 @@ impl Bytes {
 
         let mut ret = self.clone();
         ret.len = at;
+        // SAFETY: `at` was validated against the current slice length.
         self.ptr = unsafe { self.ptr.add(at) };
         self.len -= at;
         ret
@@ -353,6 +426,8 @@ impl Bytes {
     #[inline]
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: every constructor maintains a live pointer to at least `len`
+        // initialized bytes; the owning handle keeps that storage alive.
         unsafe { slice::from_raw_parts(self.ptr, self.len) }
     }
 
@@ -361,15 +436,21 @@ impl Bytes {
     #[must_use]
     pub fn is_unique(&self) -> bool {
         if ptr::eq(self.vtable, &SHARED_VTABLE) && !self.data.is_null() {
+            // SAFETY: the vtable discriminant proves `data` is `SharedData`.
             unsafe { (*self.data).ref_cnt.get() == 1 }
         } else {
             false
         }
     }
 
-    /// Tries to convert this `Bytes` to a `BytesMut`.
+    /// Tries to convert this `Bytes` to a `BytesMut` without copying.
+    ///
+    /// This succeeds only for uniquely owned allocation-backed bytes.
     pub fn try_into_mut(self) -> Result<BytesMut, Bytes> {
         if ptr::eq(self.vtable, &SHARED_VTABLE) && !self.data.is_null() {
+            // SAFETY: the vtable discriminant proves the control-block type.
+            // Uniqueness permits transferring its mutable allocation, and the
+            // visible slice is always contained in that allocation.
             unsafe {
                 if (*self.data).ref_cnt.get() == 1 {
                     let data = self.data;
@@ -413,13 +494,18 @@ impl Drop for Bytes {
 
 impl BytesMut {
     /// Creates a new `BytesMut` with the specified capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` exceeds the maximum allocation size.
     #[inline]
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         if capacity == 0 {
             return Self::new();
         }
-        let layout = Layout::from_size_align(capacity, 1).unwrap();
+        let layout = allocation_layout(capacity);
+        // SAFETY: `layout` is non-zero and valid for a byte allocation.
         let ptr = unsafe { std::alloc::alloc(layout) };
         let ptr = NonNull::new(ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
         BytesMut {
@@ -456,7 +542,7 @@ impl BytesMut {
         self.len == 0
     }
 
-    /// Returns the remaining capacity in the buffer.
+    /// Returns the total capacity of the buffer from its current start.
     #[inline]
     #[must_use]
     pub const fn capacity(&self) -> usize {
@@ -477,42 +563,80 @@ impl BytesMut {
     }
 
     /// Reserves capacity for at least `additional` more bytes to be inserted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the resulting capacity overflows or exceeds the maximum
+    /// allocation size.
     pub fn reserve(&mut self, additional: usize) {
-        if self.cap >= self.len + additional {
+        let remaining = self.cap - self.len;
+        if additional <= remaining {
             return;
         }
+
+        let required = self.len.checked_add(additional).expect("capacity overflow");
 
         let alloc_cap = if self.data.is_null() {
             self.cap
         } else {
+            // SAFETY: non-null `data` always points to a live `SharedData`.
             unsafe { (*self.data).alloc_cap }
         };
 
-        let new_cap = (alloc_cap * 2).max(self.len + additional).max(64);
+        let doubled = alloc_cap.checked_mul(2).unwrap_or(required);
+        let new_cap = doubled.max(required).max(64);
 
         if self.data.is_null() {
             if self.cap == 0 {
-                let layout = Layout::from_size_align(new_cap, 1).unwrap();
+                let layout = allocation_layout(new_cap);
+                // SAFETY: `layout` is non-zero and valid.
                 let new_ptr = unsafe { std::alloc::alloc(layout) };
                 self.ptr = NonNull::new(new_ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
                 self.cap = new_cap;
                 return;
             }
 
+            // SAFETY: an unshared handle with non-zero capacity owns the block
+            // described by `self.ptr` and `self.cap`.
             let new_ptr = unsafe {
-                let layout = Layout::from_size_align_unchecked(self.cap, 1);
+                let layout = allocation_layout(self.cap);
+                let new_layout = allocation_layout(new_cap);
                 let ptr = std::alloc::realloc(self.ptr.as_ptr(), layout, new_cap);
-                NonNull::new(ptr)
-                    .unwrap_or_else(|| std::alloc::handle_alloc_error(Layout::from_size_align_unchecked(new_cap, 1)))
+                NonNull::new(ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(new_layout))
             };
             self.ptr = new_ptr;
             self.cap = new_cap;
         } else {
+            // SAFETY: this branch is selected only for a live control block.
             let shared = unsafe { &*self.data };
             if shared.ref_cnt.get() == 1 {
                 let offset = self.ptr.as_ptr() as usize - shared.alloc_ptr.as_ptr() as usize;
 
-                if offset > 0 && shared.alloc_cap >= self.len + additional {
+                if shared.alloc_cap == 0 {
+                    let layout = allocation_layout(new_cap);
+                    // SAFETY: `layout` is non-zero and valid.
+                    let new_alloc_ptr = unsafe { std::alloc::alloc(layout) };
+                    let new_alloc_ptr =
+                        NonNull::new(new_alloc_ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+                    self.ptr = new_alloc_ptr;
+                    self.cap = new_cap;
+                    // SAFETY: uniqueness gives exclusive access to the control
+                    // block, which did not previously own an allocation.
+                    unsafe {
+                        (*self.data).alloc_ptr = new_alloc_ptr;
+                        (*self.data).alloc_cap = new_cap;
+                    }
+                    return;
+                }
+
+                if shared.alloc_cap - offset >= required {
+                    self.cap = shared.alloc_cap - offset;
+                    return;
+                }
+
+                if offset > 0 && shared.alloc_cap >= required {
+                    // SAFETY: source and destination are within the same live
+                    // allocation; `copy` permits overlap.
                     unsafe {
                         ptr::copy(self.ptr.as_ptr(), shared.alloc_ptr.as_ptr(), self.len);
                     }
@@ -521,32 +645,43 @@ impl BytesMut {
                     return;
                 }
 
+                let required_alloc_cap = offset.checked_add(required).expect("capacity overflow");
+                let new_alloc_cap = new_cap.max(required_alloc_cap);
+                // SAFETY: uniqueness gives ownership of the allocation, whose
+                // base and layout are recorded in `shared`.
                 let new_alloc_ptr = unsafe {
-                    let layout = Layout::from_size_align_unchecked(shared.alloc_cap, 1);
-                    let ptr = std::alloc::realloc(shared.alloc_ptr.as_ptr(), layout, new_cap);
-                    NonNull::new(ptr).unwrap_or_else(|| {
-                        std::alloc::handle_alloc_error(Layout::from_size_align_unchecked(new_cap, 1))
-                    })
+                    let layout = allocation_layout(shared.alloc_cap);
+                    let new_layout = allocation_layout(new_alloc_cap);
+                    let ptr = std::alloc::realloc(shared.alloc_ptr.as_ptr(), layout, new_alloc_cap);
+                    NonNull::new(ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(new_layout))
                 };
 
+                // SAFETY: `new_alloc_cap` includes `offset`, so this pointer is
+                // in bounds and cannot be null.
                 self.ptr = unsafe { NonNull::new_unchecked(new_alloc_ptr.as_ptr().add(offset)) };
-                self.cap = new_cap - offset;
+                self.cap = new_alloc_cap - offset;
 
+                // SAFETY: uniqueness gives exclusive access to the live
+                // control block.
                 unsafe {
                     (*self.data).alloc_ptr = new_alloc_ptr;
-                    (*self.data).alloc_cap = new_cap;
+                    (*self.data).alloc_cap = new_alloc_cap;
                 }
             } else {
-                let layout = Layout::from_size_align(new_cap, 1).unwrap();
+                let layout = allocation_layout(new_cap);
+                // SAFETY: `layout` is non-zero and valid.
                 let new_alloc_ptr = unsafe { std::alloc::alloc(layout) };
                 let new_alloc_ptr =
                     NonNull::new(new_alloc_ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
 
+                // SAFETY: both regions are valid for `self.len` bytes and are
+                // in distinct allocations.
                 unsafe {
                     ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_alloc_ptr.as_ptr(), self.len);
                 }
 
                 let cnt = shared.ref_cnt.get();
+                debug_assert!(cnt > 1, "shared allocation must have another owner");
                 shared.ref_cnt.set(cnt - 1);
 
                 self.ptr = new_alloc_ptr;
@@ -556,17 +691,34 @@ impl BytesMut {
         }
     }
 
-    /// Try to reclaim capacity without reallocating
+    /// Tries to reclaim capacity without reallocating.
+    ///
+    /// Returns `true` when at least `additional` bytes of spare capacity are
+    /// available afterward.
+    #[must_use = "consider BytesMut::reserve if allocation is acceptable"]
     pub fn try_reclaim(&mut self, additional: usize) -> bool {
+        if additional <= self.cap - self.len {
+            return true;
+        }
+
+        let Some(required) = self.len.checked_add(additional) else {
+            return false;
+        };
+
         if self.data.is_null() {
             // Cannot easily reclaim without `SharedData` because we don't know original ptr
             false
         } else {
+            // SAFETY: non-null `data` points to the live shared allocation.
+            // Uniqueness is checked before moving bytes within it.
             unsafe {
                 let shared = &*self.data;
                 if shared.ref_cnt.get() == 1 {
                     let offset = self.ptr.as_ptr() as usize - shared.alloc_ptr.as_ptr() as usize;
-                    if offset > 0 && shared.alloc_cap >= self.len + additional {
+                    if shared.alloc_cap - offset >= required {
+                        self.cap = shared.alloc_cap - offset;
+                        true
+                    } else if offset > 0 && shared.alloc_cap >= required {
                         ptr::copy(self.ptr.as_ptr(), shared.alloc_ptr.as_ptr(), self.len);
                         self.ptr = shared.alloc_ptr;
                         self.cap = shared.alloc_cap;
@@ -585,6 +737,8 @@ impl BytesMut {
     #[inline]
     pub fn extend_from_slice(&mut self, extend: &[u8]) {
         self.reserve(extend.len());
+        // SAFETY: reservation guarantees writable tail space. A safe caller
+        // cannot alias `extend` with the mutably borrowed `self`.
         unsafe {
             ptr::copy_nonoverlapping(extend.as_ptr(), self.ptr.as_ptr().add(self.len), extend.len());
         }
@@ -592,6 +746,10 @@ impl BytesMut {
     }
 
     /// Extends the buffer from within itself.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range is out of bounds or capacity overflows.
     pub fn extend_from_within<R>(&mut self, range: R)
     where
         R: RangeBounds<usize>,
@@ -599,11 +757,11 @@ impl BytesMut {
         let len = self.len;
         let start = match range.start_bound() {
             | Bound::Included(&n) => n,
-            | Bound::Excluded(&n) => n + 1,
+            | Bound::Excluded(&n) => n.checked_add(1).expect("range start overflow"),
             | Bound::Unbounded => 0,
         };
         let end = match range.end_bound() {
-            | Bound::Included(&n) => n + 1,
+            | Bound::Included(&n) => n.checked_add(1).expect("range end overflow"),
             | Bound::Excluded(&n) => n,
             | Bound::Unbounded => len,
         };
@@ -611,6 +769,8 @@ impl BytesMut {
 
         let cnt = end - start;
         self.reserve(cnt);
+        // SAFETY: the source range was validated against initialized bytes and
+        // the reserved destination immediately follows them, so it is disjoint.
         unsafe {
             ptr::copy_nonoverlapping(self.ptr.as_ptr().add(start), self.ptr.as_ptr().add(self.len), cnt);
         }
@@ -621,6 +781,7 @@ impl BytesMut {
     #[inline]
     pub fn put_u8(&mut self, n: u8) {
         self.reserve(1);
+        // SAFETY: reservation guarantees one writable byte at `len`.
         unsafe {
             self.ptr.as_ptr().add(self.len).write(n);
         }
@@ -628,15 +789,21 @@ impl BytesMut {
     }
 
     /// Splits the buffer into two at the given index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `at` exceeds the buffer length.
+    #[must_use = "consider BytesMut::truncate if you don't need the other half"]
     pub fn split_off(&mut self, at: usize) -> BytesMut {
         assert!(at <= self.len, "split_off out of bounds: {} <= {}", at, self.len);
 
         self.promote();
+        // SAFETY: promotion installs a live shared control block.
         unsafe {
-            let cnt = (*self.data).ref_cnt.get();
-            (*self.data).ref_cnt.set(cnt + 1);
+            increment_ref_count(&(*self.data).ref_cnt);
         }
 
+        // SAFETY: `at <= len <= cap`, including the permitted one-past pointer.
         let new_ptr = unsafe { NonNull::new_unchecked(self.ptr.as_ptr().add(at)) };
         let new_len = self.len - at;
         let new_cap = self.cap - at;
@@ -653,19 +820,25 @@ impl BytesMut {
     }
 
     /// Splits the buffer into two at the given index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `at` exceeds the buffer length.
+    #[must_use = "consider Buf::advance if you don't need the other half"]
     pub fn split_to(&mut self, at: usize) -> BytesMut {
         assert!(at <= self.len, "split_to out of bounds: {} <= {}", at, self.len);
 
         self.promote();
+        // SAFETY: promotion installs a live shared control block.
         unsafe {
-            let cnt = (*self.data).ref_cnt.get();
-            (*self.data).ref_cnt.set(cnt + 1);
+            increment_ref_count(&(*self.data).ref_cnt);
         }
 
         let new_ptr = self.ptr;
         let new_len = at;
         let new_cap = at;
 
+        // SAFETY: `at <= len <= cap`, including the permitted one-past pointer.
         self.ptr = unsafe { NonNull::new_unchecked(self.ptr.as_ptr().add(at)) };
         self.len -= at;
         self.cap -= at;
@@ -679,6 +852,7 @@ impl BytesMut {
     }
 
     /// Splits the buffer into two at the current length.
+    #[must_use]
     pub fn split(&mut self) -> BytesMut {
         let len = self.len;
         self.split_to(len)
@@ -694,6 +868,8 @@ impl BytesMut {
             return;
         }
 
+        // SAFETY: `len <= cap`, so computing the end of the initialized region
+        // stays within the allocation.
         let contiguous = unsafe { self.ptr.as_ptr().add(self.len) == other.ptr.as_ptr() };
         let same_alloc = !self.data.is_null() && !other.data.is_null() && ptr::eq(self.data, other.data);
 
@@ -734,6 +910,7 @@ impl BytesMut {
     }
 
     /// Freezes the `BytesMut` into a `Bytes`.
+    #[must_use]
     pub fn freeze(mut self) -> Bytes {
         self.promote();
         let data = self.data;
@@ -756,6 +933,7 @@ impl BytesMut {
         if new_len > self.len {
             let additional = new_len - self.len;
             self.reserve(additional);
+            // SAFETY: reservation made the requested tail writable.
             unsafe {
                 ptr::write_bytes(self.ptr.as_ptr().add(self.len), value, additional);
             }
@@ -775,12 +953,15 @@ impl Clone for BytesMut {
 impl Drop for BytesMut {
     fn drop(&mut self) {
         if !self.data.is_null() {
+            // SAFETY: non-null `data` is a live control block held by this
+            // reference; the last reference owns the recorded allocation.
             unsafe {
                 let shared = self.data;
                 let cnt = (*shared).ref_cnt.get();
+                debug_assert!(cnt > 0, "reference count underflow");
                 if cnt == 1 {
                     if (*shared).alloc_cap > 0 {
-                        let layout = Layout::from_size_align_unchecked((*shared).alloc_cap, 1);
+                        let layout = allocation_layout((*shared).alloc_cap);
                         std::alloc::dealloc((*shared).alloc_ptr.as_ptr(), layout);
                     }
                     drop(Box::from_raw(shared));
@@ -789,8 +970,10 @@ impl Drop for BytesMut {
                 }
             }
         } else if self.cap > 0 {
+            // SAFETY: an unshared non-empty allocation is owned exclusively by
+            // this handle and described by `ptr` and `cap`.
             unsafe {
-                let layout = Layout::from_size_align_unchecked(self.cap, 1);
+                let layout = allocation_layout(self.cap);
                 std::alloc::dealloc(self.ptr.as_ptr(), layout);
             }
         }
@@ -813,6 +996,7 @@ impl Buf for Bytes {
     #[inline]
     fn advance(&mut self, cnt: usize) {
         assert!(cnt <= self.len(), "advance out of bounds: {} <= {}", cnt, self.len());
+        // SAFETY: `cnt` was validated against the visible slice length.
         self.ptr = unsafe { self.ptr.add(cnt) };
         self.len -= cnt;
     }
@@ -836,21 +1020,17 @@ impl Buf for BytesMut {
             return;
         }
 
-        if self.data.is_null() {
-            let shared = Box::new(SharedData {
-                ref_cnt:   Cell::new(1),
-                alloc_ptr: self.ptr,
-                alloc_cap: self.cap,
-            });
-            self.data = Box::into_raw(shared);
-        }
+        self.promote();
 
+        // SAFETY: `cnt <= len <= cap`, including a one-past pointer.
         self.ptr = unsafe { NonNull::new_unchecked(self.ptr.as_ptr().add(cnt)) };
         self.len -= cnt;
         self.cap -= cnt;
     }
 }
 
+// SAFETY: `chunk_mut` exposes only spare capacity, `advance_mut` validates its
+// bound, and all initialized bytes remain live for the duration of the handle.
 unsafe impl BufMut for BytesMut {
     #[inline]
     fn remaining_mut(&self) -> usize {
@@ -868,6 +1048,7 @@ unsafe impl BufMut for BytesMut {
         if self.cap == self.len {
             self.reserve(64);
         }
+        // SAFETY: the returned range is exactly the allocation's spare tail.
         unsafe {
             let ptr = self.ptr.as_ptr().add(self.len);
             let len = self.cap - self.len;
@@ -909,6 +1090,8 @@ impl Deref for BytesMut {
 
     #[inline]
     fn deref(&self) -> &[u8] {
+        // SAFETY: `len` initialized bytes starting at `ptr` stay live while
+        // this handle owns its allocation reference.
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 }
@@ -916,6 +1099,8 @@ impl Deref for BytesMut {
 impl DerefMut for BytesMut {
     #[inline]
     fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: mutable handles either own the allocation uniquely or cover
+        // a region disjoint from every other handle sharing it.
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
@@ -1070,21 +1255,9 @@ impl From<&str> for BytesMut {
 
 impl From<Bytes> for BytesMut {
     fn from(bytes: Bytes) -> Self {
-        if ptr::eq(bytes.vtable, &SHARED_VTABLE) && !bytes.data.is_null() {
-            let data = bytes.data;
-            let ptr = unsafe { NonNull::new_unchecked(bytes.ptr as *mut u8) };
-            let len = bytes.len;
-            mem::forget(bytes);
-            BytesMut {
-                ptr,
-                len,
-                cap: len,
-                data,
-            }
-        } else {
-            let mut b = BytesMut::with_capacity(bytes.len());
-            b.put_slice(&bytes);
-            b
+        match bytes.try_into_mut() {
+            | Ok(bytes) => bytes,
+            | Err(bytes) => Self::from(bytes.as_slice()),
         }
     }
 }
@@ -1102,6 +1275,9 @@ impl From<Bytes> for Vec<u8> {
         let ptr = bytes.ptr;
 
         if ptr::eq(bytes.vtable, &SHARED_VTABLE) && !bytes.data.is_null() {
+            // SAFETY: the vtable identifies `data` as `SharedData`. With one
+            // reference, ownership of the original byte allocation can move to
+            // the returned `Vec` after shifting the visible region to its base.
             unsafe {
                 if (*bytes.data).ref_cnt.get() == 1 {
                     let shared = Box::from_raw(bytes.data);
@@ -1120,6 +1296,8 @@ impl From<Bytes> for Vec<u8> {
         }
 
         let mut vec = Vec::with_capacity(len);
+        // SAFETY: the source has `len` initialized bytes and the fresh vector
+        // has room for them; the allocations do not overlap.
         unsafe {
             ptr::copy_nonoverlapping(ptr, vec.as_mut_ptr(), len);
             vec.set_len(len);
@@ -1136,10 +1314,14 @@ impl From<BytesMut> for Vec<u8> {
         if bytes.data.is_null() {
             let cap = bytes.cap;
             bytes.cap = 0; // prevent drop
+            // SAFETY: an unshared `BytesMut` owns a Vec-compatible allocation
+            // described by exactly this pointer, length, and capacity.
             unsafe {
                 return Vec::from_raw_parts(ptr, len, cap);
             }
         } else {
+            // SAFETY: non-null `data` identifies the shared control block. A
+            // unique reference may transfer its allocation to the `Vec`.
             unsafe {
                 let shared = bytes.data;
                 if (*shared).ref_cnt.get() == 1 {
@@ -1160,6 +1342,8 @@ impl From<BytesMut> for Vec<u8> {
         }
 
         let mut vec = Vec::with_capacity(len);
+        // SAFETY: the source has `len` initialized bytes and the fresh vector
+        // has room for them; shared ownership keeps the source alive.
         unsafe {
             ptr::copy_nonoverlapping(ptr, vec.as_mut_ptr(), len);
             vec.set_len(len);
@@ -1171,6 +1355,8 @@ impl From<BytesMut> for Vec<u8> {
 impl Extend<u8> for BytesMut {
     #[inline]
     fn extend<T: IntoIterator<Item = u8>>(&mut self, iter: T) {
+        let iter = iter.into_iter();
+        self.reserve(iter.size_hint().0);
         for b in iter {
             self.put_u8(b);
         }
@@ -1180,6 +1366,8 @@ impl Extend<u8> for BytesMut {
 impl<'a> Extend<&'a u8> for BytesMut {
     #[inline]
     fn extend<T: IntoIterator<Item = &'a u8>>(&mut self, iter: T) {
+        let iter = iter.into_iter();
+        self.reserve(iter.size_hint().0);
         for &b in iter {
             self.put_u8(b);
         }
@@ -1208,6 +1396,12 @@ impl<'a> FromIterator<&'a u8> for Bytes {
     }
 }
 
+impl<'a> FromIterator<&'a u8> for BytesMut {
+    fn from_iter<I: IntoIterator<Item = &'a u8>>(iter: I) -> Self {
+        iter.into_iter().copied().collect()
+    }
+}
+
 impl IntoIterator for Bytes {
     type IntoIter = bytes::buf::IntoIter<Bytes>;
     type Item = u8;
@@ -1225,6 +1419,26 @@ impl<'a> IntoIterator for &'a Bytes {
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.as_slice().iter()
+    }
+}
+
+impl IntoIterator for BytesMut {
+    type IntoIter = bytes::buf::IntoIter<BytesMut>;
+    type Item = u8;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        bytes::buf::IntoIter::new(self)
+    }
+}
+
+impl<'a> IntoIterator for &'a BytesMut {
+    type IntoIter = slice::Iter<'a, u8>;
+    type Item = &'a u8;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_ref().iter()
     }
 }
 
@@ -1330,6 +1544,29 @@ impl PartialEq for BytesMut {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for BytesMut {}
+
+impl PartialOrd for BytesMut {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BytesMut {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_ref().cmp(other.as_ref())
+    }
+}
+
+impl Hash for BytesMut {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_ref().hash(state);
     }
 }
 
@@ -1484,14 +1721,14 @@ mod tests {
     fn try_reclaim_vec() {
         let mut buf = BytesMut::with_capacity(6);
         buf.put_slice(b"abc");
-        assert_eq!(false, buf.try_reclaim(usize::MAX));
-        assert_eq!(false, buf.try_reclaim(6));
+        assert!(!buf.try_reclaim(usize::MAX));
+        assert!(!buf.try_reclaim(6));
         buf.advance(2);
         assert_eq!(4, buf.capacity());
-        assert_eq!(false, buf.try_reclaim(6));
-        assert_eq!(true, buf.try_reclaim(5));
+        assert!(!buf.try_reclaim(6));
+        assert!(buf.try_reclaim(5));
         buf.advance(1);
-        assert_eq!(true, buf.try_reclaim(6));
+        assert!(buf.try_reclaim(6));
         assert_eq!(6, buf.capacity());
     }
 
@@ -1620,7 +1857,9 @@ mod tests {
     #[should_panic(expected = "range start must not be greater than end")]
     fn bytes_slice_invalid_range() {
         let b = Bytes::from_static(b"hello");
-        let _ = b.slice(3 .. 2);
+        let start = 3;
+        let end = 2;
+        let _ = b.slice(start .. end);
     }
 
     #[test]
@@ -1716,6 +1955,8 @@ mod tests {
         b.put_slice(b"abc");
         assert_eq!(b.as_ref(), b"abc");
 
+        // SAFETY: the test is deliberately marking two spare bytes initialized;
+        // their values are not subsequently read.
         unsafe {
             b.advance_mut(2); // directly advance length
         }
@@ -1779,6 +2020,27 @@ mod tests {
 
         let bm: BytesMut = data.clone().into_iter().collect();
         assert_eq!(bm.as_ref(), &data[..]);
+
+        let from_refs: BytesMut = data.iter().collect();
+        assert_eq!(from_refs.as_ref(), data.as_slice());
+    }
+
+    #[test]
+    fn bytes_mut_order_hash_and_iteration_follow_slice() {
+        use std::collections::hash_map::DefaultHasher;
+
+        let first = BytesMut::from(&b"abc"[..]);
+        let second = BytesMut::from(&b"abd"[..]);
+        assert!(first < second);
+
+        let mut buffer_hasher = DefaultHasher::new();
+        first.hash(&mut buffer_hasher);
+        let mut slice_hasher = DefaultHasher::new();
+        b"abc".as_slice().hash(&mut slice_hasher);
+        assert_eq!(buffer_hasher.finish(), slice_hasher.finish());
+
+        assert_eq!((&first).into_iter().copied().collect::<Vec<_>>(), b"abc");
+        assert_eq!(first.into_iter().collect::<Vec<_>>(), b"abc");
     }
 
     #[test]
@@ -1883,9 +2145,7 @@ mod tests {
 
         let bm = BytesMut::from(b);
         assert_eq!(bm.as_ref(), b"short");
-        // Capacity of reconstructed unfrozen mut bytes starts as the length of the
-        // slice
-        assert_eq!(bm.capacity(), 5);
+        assert_eq!(bm.capacity(), 100);
     }
 
     #[test]
@@ -1898,6 +2158,23 @@ mod tests {
 
         let s_from_max = b.slice(0 .. 3);
         assert_eq!(s_from_max.as_slice(), b"abc");
+
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| b.slice(..= usize::MAX))).is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                b.slice((Bound::Excluded(usize::MAX), Bound::Unbounded))
+            }))
+            .is_err()
+        );
+
+        let mut mutable = BytesMut::from(&b"abc"[..]);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                mutable.extend_from_within(..= usize::MAX);
+            }))
+            .is_err()
+        );
+        assert_eq!(mutable.as_ref(), b"abc");
     }
 
     #[test]
@@ -1914,8 +2191,230 @@ mod tests {
     #[should_panic(expected = "advance out of bounds")]
     fn test_buf_mut_advance_past_capacity_panic() {
         let mut b = BytesMut::with_capacity(5);
+        // SAFETY: this intentionally violates the precondition to verify the
+        // runtime bounds assertion before any length change occurs.
         unsafe {
             b.advance_mut(10);
         }
+    }
+
+    #[test]
+    fn from_owner_is_pinned_before_as_ref() {
+        let drop_counter = SharedAtomicCounter::new();
+        let bytes = Bytes::from_owner(OwnedTester::new([1, 2, 3, 4, 5], drop_counter));
+        // SAFETY: `bytes` was constructed with this exact owner type, and the
+        // test holds the owning handle for the duration of the borrow.
+        let owner = unsafe { &*(bytes.data as *const OwnerData<OwnedTester<5>>) };
+
+        assert_eq!(bytes.as_ptr(), owner.owner.buf.as_ptr());
+        assert_eq!(bytes.as_slice(), &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn from_owner_reuses_type_vtable() {
+        let first = Bytes::from_owner(vec![1, 2, 3]);
+        let second = Bytes::from_owner(vec![4, 5, 6]);
+
+        assert!(ptr::eq(first.vtable, second.vtable));
+    }
+
+    #[test]
+    fn from_owner_drops_owner_when_as_ref_panics() {
+        struct PanickingOwner(SharedAtomicCounter);
+
+        impl AsRef<[u8]> for PanickingOwner {
+            fn as_ref(&self) -> &[u8] {
+                panic!("AsRef panic");
+            }
+        }
+
+        impl Drop for PanickingOwner {
+            fn drop(&mut self) {
+                self.0.increment();
+            }
+        }
+
+        let drop_counter = SharedAtomicCounter::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let drop_counter = drop_counter.clone();
+            move || {
+                let _ = Bytes::from_owner(PanickingOwner(drop_counter));
+            }
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(drop_counter.get(), 1);
+    }
+
+    #[test]
+    fn shared_bytes_to_bytes_mut_makes_an_independent_copy() {
+        let bytes = Bytes::from(vec![1, 2, 3, 4]);
+        let clone = bytes.clone();
+        let mut mutable = BytesMut::from(clone);
+
+        mutable[0] = 9;
+
+        assert_eq!(bytes.as_slice(), &[1, 2, 3, 4]);
+        assert_eq!(mutable.as_ref(), &[9, 2, 3, 4]);
+    }
+
+    #[test]
+    fn cloning_cannot_overflow_the_reference_count() {
+        let bytes = BytesMut::from(&b"data"[..]).freeze();
+        // SAFETY: this white-box test has a live shared control block and
+        // restores its count before the owning handle is dropped.
+        unsafe {
+            (*bytes.data).ref_cnt.set((usize::MAX >> 1) + 1);
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bytes.clone()));
+        assert!(result.is_err());
+
+        // SAFETY: see above; restoring the sole real reference reestablishes
+        // the normal drop invariant.
+        unsafe {
+            (*bytes.data).ref_cnt.set(1);
+        }
+    }
+
+    #[test]
+    fn reserve_after_advance_accounts_for_allocation_offset() {
+        let mut bytes = BytesMut::with_capacity(64);
+        bytes.resize(64, 7);
+        bytes.advance(60);
+
+        bytes.reserve(1_000);
+        assert!(bytes.capacity() - bytes.len() >= 1_000);
+        bytes.extend_from_slice(&vec![8; 1_000]);
+
+        assert_eq!(bytes.len(), 1_004);
+        assert_eq!(&bytes[.. 4], &[7; 4]);
+        assert!(bytes[4 ..].iter().all(|&byte| byte == 8));
+    }
+
+    #[test]
+    fn reserving_a_promoted_empty_buffer_allocates_normally() {
+        let frozen = BytesMut::new().freeze();
+        let mut bytes = frozen.try_into_mut().expect("the empty allocation is unique");
+
+        bytes.reserve(8);
+        bytes.extend_from_slice(b"contents");
+
+        assert_eq!(bytes.as_ref(), b"contents");
+    }
+
+    #[test]
+    fn capacity_overflow_panics_without_modifying_buffer() {
+        let mut bytes = BytesMut::from(&b"x"[..]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bytes.reserve(usize::MAX);
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(bytes.as_ref(), b"x");
+        assert!(!bytes.try_reclaim(usize::MAX));
+    }
+
+    #[test]
+    fn try_reclaim_succeeds_when_spare_capacity_is_already_available() {
+        let mut bytes = BytesMut::with_capacity(16);
+        bytes.extend_from_slice(b"data");
+
+        assert!(bytes.try_reclaim(12));
+        assert_eq!(bytes.as_ref(), b"data");
+        assert_eq!(bytes.capacity(), 16);
+    }
+
+    #[test]
+    fn try_reclaim_recovers_dropped_split_capacity() {
+        let mut prefix = BytesMut::with_capacity(64);
+        prefix.extend_from_slice(b"abcdefgh");
+        let suffix = prefix.split_off(4);
+        drop(suffix);
+
+        assert_eq!(prefix.capacity(), 4);
+        assert!(prefix.try_reclaim(60));
+        assert_eq!(prefix.capacity(), 64);
+        assert_eq!(prefix.as_ref(), b"abcd");
+    }
+
+    #[test]
+    fn try_reclaim_moves_an_advanced_unique_split_to_the_allocation_base() {
+        let mut prefix = BytesMut::with_capacity(64);
+        prefix.extend_from_slice(b"abcdefgh");
+        let mut suffix = prefix.split_off(4);
+        drop(prefix);
+
+        assert!(suffix.try_reclaim(60));
+        assert_eq!(suffix.capacity(), 64);
+        assert_eq!(suffix.as_ref(), b"efgh");
+    }
+
+    #[test]
+    fn operation_sequence_matches_vec_model() {
+        let mut seed = 0x4D59_5DF4_D0F3_3173_u64;
+        let mut bytes = BytesMut::new();
+        let mut model = Vec::new();
+
+        for _ in 0 .. 10_000 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            match (seed >> 32) % 8 {
+                | 0 => {
+                    let byte = seed as u8;
+                    bytes.put_u8(byte);
+                    model.push(byte);
+                },
+                | 1 => {
+                    let data = seed.to_le_bytes();
+                    let count = (seed as usize) % (data.len() + 1);
+                    bytes.extend_from_slice(&data[.. count]);
+                    model.extend_from_slice(&data[.. count]);
+                },
+                | 2 if !model.is_empty() => {
+                    let new_len = (seed as usize) % (model.len() + 1);
+                    bytes.truncate(new_len);
+                    model.truncate(new_len);
+                },
+                | 3 if !model.is_empty() => {
+                    let count = (seed as usize) % (model.len() + 1);
+                    bytes.advance(count);
+                    model.drain(.. count);
+                },
+                | 4 => {
+                    let additional = (seed as usize) % 128;
+                    bytes.reserve(additional);
+                    assert!(bytes.capacity() - bytes.len() >= additional);
+                },
+                | 5 if !model.is_empty() => {
+                    let start = (seed as usize) % model.len();
+                    let end = start + ((seed >> 16) as usize) % (model.len() - start + 1);
+                    bytes.extend_from_within(start .. end);
+                    model.extend_from_within(start .. end);
+                },
+                | 6 => {
+                    let at = if model.is_empty() {
+                        0
+                    } else {
+                        (seed as usize) % (model.len() + 1)
+                    };
+                    let mut suffix = bytes.split_off(at);
+                    assert_eq!(bytes.as_ref(), &model[.. at]);
+                    assert_eq!(suffix.as_ref(), &model[at ..]);
+                    bytes.unsplit(mem::take(&mut suffix));
+                },
+                | 7 => {
+                    let frozen = mem::take(&mut bytes).freeze();
+                    let snapshot = frozen.clone();
+                    bytes = BytesMut::from(frozen);
+                    assert_eq!(snapshot.as_slice(), model.as_slice());
+                },
+                | _ => {},
+            }
+
+            assert_eq!(bytes.as_ref(), model.as_slice());
+        }
+
+        let round_trip: Vec<u8> = bytes.into();
+        assert_eq!(round_trip, model);
     }
 }
