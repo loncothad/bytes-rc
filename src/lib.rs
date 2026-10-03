@@ -119,7 +119,10 @@ fn allocate(capacity: usize) -> NonNull<u8> {
     let layout = allocation_layout(capacity);
     // Global is equivalent to the global allocation functions, which ignore
     // excess size. Retaining the requested capacity keeps Vec transfers valid.
-    Global.allocate(layout).unwrap_or_else(|_| handle_alloc_error(layout)).cast()
+    Global
+        .allocate(layout)
+        .unwrap_or_else(|_| handle_alloc_error(layout))
+        .cast()
 }
 
 static SHARED_VTABLE: Vtable = Vtable {
@@ -610,7 +613,10 @@ impl BytesMut {
             let new_ptr = unsafe {
                 let layout = allocation_layout(self.cap);
                 let new_layout = allocation_layout(new_cap);
-                Global.grow(self.ptr, layout, new_layout).unwrap_or_else(|_| handle_alloc_error(new_layout)).cast()
+                Global
+                    .grow(self.ptr, layout, new_layout)
+                    .unwrap_or_else(|_| handle_alloc_error(new_layout))
+                    .cast()
             };
             self.ptr = new_ptr;
             self.cap = new_cap;
@@ -656,9 +662,10 @@ impl BytesMut {
                 let new_alloc_ptr = unsafe {
                     let layout = allocation_layout(shared.alloc_cap);
                     let new_layout = allocation_layout(new_alloc_cap);
-                    Global.grow(shared.alloc_ptr, layout, new_layout)
+                    Global
+                        .grow(shared.alloc_ptr, layout, new_layout)
                         .unwrap_or_else(|_| handle_alloc_error(new_layout))
-                        .cast()
+                        .cast::<u8>()
                 };
 
                 // SAFETY: `new_alloc_cap` includes `offset`, so this pointer is
@@ -707,7 +714,8 @@ impl BytesMut {
         };
 
         if self.data.is_null() {
-            // Cannot easily reclaim without `SharedData` because we don't know original ptr
+            // Cannot easily reclaim without `SharedData` because we don't know
+            // original ptr
             false
         } else {
             // SAFETY: non-null `data` points to the live shared allocation.

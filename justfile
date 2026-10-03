@@ -1,6 +1,6 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
-cargo := "cargo +beta"
+cargo := "cargo"
 nightly_cargo := "cargo +nightly"
 miri_flags := "-Zmiri-strict-provenance"
 

@@ -33,20 +33,18 @@ assert_eq!(clone, b"world".as_slice());
 ## Rust version and development
 
 The minimum supported Rust version (MSRV) is 1.100, which stabilizes the
-`Allocator` API used for buffer allocations. Rust 1.100 is currently in beta,
-so `rust-toolchain.toml` temporarily selects `beta`. After Rust 1.100 is
-released, switch its channel to `1.100.0` and use that toolchain for development
-commands instead of `+beta`.
+`Allocator` API used for buffer allocations. The intended baseline is the
+Rust 1.100 stable release; this repository does not pin a beta toolchain.
 
 ```sh
-cargo +beta check --all-targets
-cargo +beta clippy --all-targets
-cargo +beta test
+cargo check --all-targets
+cargo clippy --all-targets
+cargo test
 ```
 
-The `justfile` uses beta for builds, checks, tests, and documentation. Formatting
-still uses nightly because `.rustfmt.toml` contains nightly-only options; Miri
-also requires nightly. Install these tools with
+The `justfile` uses ordinary Cargo commands for builds, checks, tests, and
+documentation. Formatting still uses nightly because `.rustfmt.toml` contains
+nightly-only options; Miri also requires nightly. Install these tools with
 `rustup toolchain install nightly --profile minimal --component rustfmt,miri`,
 then use `just fmt-check` (which also requires Taplo) and `just miri`.
 
