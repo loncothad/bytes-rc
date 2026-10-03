@@ -41,7 +41,10 @@
 #![deny(missing_docs)]
 
 use core::{
-    alloc::Layout,
+    alloc::{
+        Allocator,
+        Layout,
+    },
     ascii,
     borrow::{
         Borrow,
@@ -66,6 +69,10 @@ use core::{
         NonNull,
     },
     slice,
+};
+use std::alloc::{
+    Global,
+    handle_alloc_error,
 };
 
 #[doc(no_inline)]
@@ -107,6 +114,14 @@ fn allocation_layout(capacity: usize) -> Layout {
     Layout::array::<u8>(capacity).expect("capacity overflow")
 }
 
+#[inline]
+fn allocate(capacity: usize) -> NonNull<u8> {
+    let layout = allocation_layout(capacity);
+    // Global is equivalent to the global allocation functions, which ignore
+    // excess size. Retaining the requested capacity keeps Vec transfers valid.
+    Global.allocate(layout).unwrap_or_else(|_| handle_alloc_error(layout)).cast()
+}
+
 static SHARED_VTABLE: Vtable = Vtable {
     clone: |b| {
         if !b.data.is_null() {
@@ -134,7 +149,7 @@ static SHARED_VTABLE: Vtable = Vtable {
                 if cnt == 1 {
                     if (*shared).alloc_cap > 0 {
                         let layout = allocation_layout((*shared).alloc_cap);
-                        std::alloc::dealloc((*shared).alloc_ptr.as_ptr(), layout);
+                        Global.deallocate((*shared).alloc_ptr, layout);
                     }
                     drop(Box::from_raw(shared));
                 } else {
@@ -504,10 +519,7 @@ impl BytesMut {
         if capacity == 0 {
             return Self::new();
         }
-        let layout = allocation_layout(capacity);
-        // SAFETY: `layout` is non-zero and valid for a byte allocation.
-        let ptr = unsafe { std::alloc::alloc(layout) };
-        let ptr = NonNull::new(ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        let ptr = allocate(capacity);
         BytesMut {
             ptr,
             len: 0,
@@ -588,10 +600,7 @@ impl BytesMut {
 
         if self.data.is_null() {
             if self.cap == 0 {
-                let layout = allocation_layout(new_cap);
-                // SAFETY: `layout` is non-zero and valid.
-                let new_ptr = unsafe { std::alloc::alloc(layout) };
-                self.ptr = NonNull::new(new_ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+                self.ptr = allocate(new_cap);
                 self.cap = new_cap;
                 return;
             }
@@ -601,8 +610,7 @@ impl BytesMut {
             let new_ptr = unsafe {
                 let layout = allocation_layout(self.cap);
                 let new_layout = allocation_layout(new_cap);
-                let ptr = std::alloc::realloc(self.ptr.as_ptr(), layout, new_cap);
-                NonNull::new(ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(new_layout))
+                Global.grow(self.ptr, layout, new_layout).unwrap_or_else(|_| handle_alloc_error(new_layout)).cast()
             };
             self.ptr = new_ptr;
             self.cap = new_cap;
@@ -613,11 +621,7 @@ impl BytesMut {
                 let offset = self.ptr.as_ptr() as usize - shared.alloc_ptr.as_ptr() as usize;
 
                 if shared.alloc_cap == 0 {
-                    let layout = allocation_layout(new_cap);
-                    // SAFETY: `layout` is non-zero and valid.
-                    let new_alloc_ptr = unsafe { std::alloc::alloc(layout) };
-                    let new_alloc_ptr =
-                        NonNull::new(new_alloc_ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+                    let new_alloc_ptr = allocate(new_cap);
                     self.ptr = new_alloc_ptr;
                     self.cap = new_cap;
                     // SAFETY: uniqueness gives exclusive access to the control
@@ -652,8 +656,9 @@ impl BytesMut {
                 let new_alloc_ptr = unsafe {
                     let layout = allocation_layout(shared.alloc_cap);
                     let new_layout = allocation_layout(new_alloc_cap);
-                    let ptr = std::alloc::realloc(shared.alloc_ptr.as_ptr(), layout, new_alloc_cap);
-                    NonNull::new(ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(new_layout))
+                    Global.grow(shared.alloc_ptr, layout, new_layout)
+                        .unwrap_or_else(|_| handle_alloc_error(new_layout))
+                        .cast()
                 };
 
                 // SAFETY: `new_alloc_cap` includes `offset`, so this pointer is
@@ -668,11 +673,7 @@ impl BytesMut {
                     (*self.data).alloc_cap = new_alloc_cap;
                 }
             } else {
-                let layout = allocation_layout(new_cap);
-                // SAFETY: `layout` is non-zero and valid.
-                let new_alloc_ptr = unsafe { std::alloc::alloc(layout) };
-                let new_alloc_ptr =
-                    NonNull::new(new_alloc_ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+                let new_alloc_ptr = allocate(new_cap);
 
                 // SAFETY: both regions are valid for `self.len` bytes and are
                 // in distinct allocations.
@@ -962,7 +963,7 @@ impl Drop for BytesMut {
                 if cnt == 1 {
                     if (*shared).alloc_cap > 0 {
                         let layout = allocation_layout((*shared).alloc_cap);
-                        std::alloc::dealloc((*shared).alloc_ptr.as_ptr(), layout);
+                        Global.deallocate((*shared).alloc_ptr, layout);
                     }
                     drop(Box::from_raw(shared));
                 } else {
@@ -974,7 +975,7 @@ impl Drop for BytesMut {
             // this handle and described by `ptr` and `cap`.
             unsafe {
                 let layout = allocation_layout(self.cap);
-                std::alloc::dealloc(self.ptr.as_ptr(), layout);
+                Global.deallocate(self.ptr, layout);
             }
         }
     }
@@ -2301,6 +2302,94 @@ mod tests {
         bytes.extend_from_slice(b"contents");
 
         assert_eq!(bytes.as_ref(), b"contents");
+    }
+
+    #[test]
+    fn allocator_vec_round_trip_preserves_requested_capacity() {
+        for capacity in [0, 1, 7, 64, 129] {
+            let mut bytes = BytesMut::with_capacity(capacity);
+            assert_eq!(bytes.capacity(), capacity);
+            bytes.resize(capacity, 42);
+            let original_ptr = bytes.as_ptr();
+
+            let vec = Vec::from(bytes);
+            assert_eq!(vec.capacity(), capacity);
+            assert_eq!(vec.as_ptr(), original_ptr);
+            assert_eq!(vec.as_slice(), vec![42; capacity]);
+
+            let frozen = BytesMut::from(vec).freeze();
+            let clone = frozen.clone();
+            drop(frozen);
+            let vec = Vec::from(clone);
+            assert_eq!(vec.capacity(), capacity);
+            assert_eq!(vec.as_ptr(), original_ptr);
+            assert_eq!(vec.as_slice(), vec![42; capacity]);
+        }
+    }
+
+    #[test]
+    fn allocator_growth_accepts_vec_allocations_and_returns_them() {
+        let mut vec = Vec::with_capacity(7);
+        vec.extend_from_slice(b"initial");
+        let original_ptr = vec.as_ptr();
+        let mut bytes = BytesMut::from(vec);
+        assert_eq!(bytes.as_ptr(), original_ptr);
+
+        bytes.reserve(100);
+        bytes.extend_from_slice(&[42; 100]);
+        let grown_ptr = bytes.as_ptr();
+        let grown_capacity = bytes.capacity();
+        let mut vec = Vec::from(bytes.freeze());
+        assert_eq!(vec.as_ptr(), grown_ptr);
+        assert_eq!(vec.capacity(), grown_capacity);
+        assert_eq!(&vec[.. 7], b"initial");
+        assert_eq!(&vec[7 ..], &[42; 100]);
+
+        vec.reserve(grown_capacity);
+        vec.extend_from_slice(b"returned");
+        let bytes = BytesMut::from(vec);
+        assert_eq!(&bytes[.. 7], b"initial");
+        assert_eq!(&bytes[7 .. 107], &[42; 100]);
+        assert_eq!(&bytes[107 ..], b"returned");
+    }
+
+    #[test]
+    fn allocator_growth_of_unique_offset_split_round_trips_to_vec() {
+        let mut bytes = BytesMut::with_capacity(16);
+        bytes.extend_from_slice(b"abcdefghijklmnop");
+        drop(bytes.split_to(12));
+
+        bytes.reserve(100);
+        assert!(bytes.capacity() >= 104);
+        bytes.extend_from_slice(&[42; 100]);
+
+        let mut vec = Vec::from(bytes.freeze());
+        assert_eq!(&vec[.. 4], b"mnop");
+        assert_eq!(&vec[4 ..], &[42; 100]);
+        vec.reserve(vec.capacity());
+        vec.extend_from_slice(b"end");
+        assert_eq!(&vec[104 ..], b"end");
+    }
+
+    #[test]
+    fn allocator_growth_detaches_from_frozen_split() {
+        let mut bytes = BytesMut::with_capacity(16);
+        bytes.extend_from_slice(b"abcdefghijklmnop");
+        let prefix = bytes.split_to(12).freeze();
+        let prefix_clone = prefix.clone();
+
+        bytes.reserve(100);
+        bytes.extend_from_slice(&[42; 100]);
+        assert_eq!(prefix.as_slice(), b"abcdefghijkl");
+        drop(prefix);
+        assert_eq!(prefix_clone.as_slice(), b"abcdefghijkl");
+        drop(prefix_clone);
+
+        let detached_ptr = bytes.as_ptr();
+        let vec = Vec::from(bytes);
+        assert_eq!(vec.as_ptr(), detached_ptr);
+        assert_eq!(&vec[.. 4], b"mnop");
+        assert_eq!(&vec[4 ..], &[42; 100]);
     }
 
     #[test]
