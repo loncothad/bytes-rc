@@ -1754,9 +1754,9 @@ impl<A: Allocator> fmt::Debug for BytesMut<A> {
 
 // Equality and comparison
 
-impl<A: Allocator> PartialEq for Bytes<A> {
+impl<A: Allocator, B: Allocator> PartialEq<Bytes<B>> for Bytes<A> {
     #[inline]
-    fn eq(&self, other: &Self) -> bool {
+    fn eq(&self, other: &Bytes<B>) -> bool {
         self.as_slice() == other.as_slice()
     }
 }
@@ -1798,9 +1798,9 @@ impl<A: Allocator> PartialEq<&[u8]> for Bytes<A> {
     }
 }
 
-impl<A: Allocator> PartialEq<Vec<u8>> for Bytes<A> {
+impl<A: Allocator, B: Allocator> PartialEq<Vec<u8, B>> for Bytes<A> {
     #[inline]
-    fn eq(&self, other: &Vec<u8>) -> bool {
+    fn eq(&self, other: &Vec<u8, B>) -> bool {
         self.as_slice() == other.as_slice()
     }
 }
@@ -1819,16 +1819,16 @@ impl<A: Allocator> PartialEq<Bytes<A>> for &[u8] {
     }
 }
 
-impl<A: Allocator> PartialEq<Bytes<A>> for Vec<u8> {
+impl<A: Allocator, B: Allocator> PartialEq<Bytes<A>> for Vec<u8, B> {
     #[inline]
     fn eq(&self, other: &Bytes<A>) -> bool {
         self.as_slice() == other.as_slice()
     }
 }
 
-impl<A: Allocator> PartialEq for BytesMut<A> {
+impl<A: Allocator, B: Allocator> PartialEq<BytesMut<B>> for BytesMut<A> {
     #[inline]
-    fn eq(&self, other: &Self) -> bool {
+    fn eq(&self, other: &BytesMut<B>) -> bool {
         self.as_ref() == other.as_ref()
     }
 }
@@ -1856,16 +1856,16 @@ impl<A: Allocator> Hash for BytesMut<A> {
     }
 }
 
-impl<A: Allocator> PartialEq<Bytes<A>> for BytesMut<A> {
+impl<A: Allocator, B: Allocator> PartialEq<Bytes<B>> for BytesMut<A> {
     #[inline]
-    fn eq(&self, other: &Bytes<A>) -> bool {
+    fn eq(&self, other: &Bytes<B>) -> bool {
         self.as_ref() == other.as_slice()
     }
 }
 
-impl<A: Allocator> PartialEq<BytesMut<A>> for Bytes<A> {
+impl<A: Allocator, B: Allocator> PartialEq<BytesMut<B>> for Bytes<A> {
     #[inline]
-    fn eq(&self, other: &BytesMut<A>) -> bool {
+    fn eq(&self, other: &BytesMut<B>) -> bool {
         self.as_slice() == other.as_ref()
     }
 }
@@ -1884,9 +1884,9 @@ impl<A: Allocator> PartialEq<&[u8]> for BytesMut<A> {
     }
 }
 
-impl<A: Allocator> PartialEq<Vec<u8>> for BytesMut<A> {
+impl<A: Allocator, B: Allocator> PartialEq<Vec<u8, B>> for BytesMut<A> {
     #[inline]
-    fn eq(&self, other: &Vec<u8>) -> bool {
+    fn eq(&self, other: &Vec<u8, B>) -> bool {
         self.as_ref() == other.as_slice()
     }
 }
@@ -1905,7 +1905,7 @@ impl<A: Allocator> PartialEq<BytesMut<A>> for &[u8] {
     }
 }
 
-impl<A: Allocator> PartialEq<BytesMut<A>> for Vec<u8> {
+impl<A: Allocator, B: Allocator> PartialEq<BytesMut<A>> for Vec<u8, B> {
     #[inline]
     fn eq(&self, other: &BytesMut<A>) -> bool {
         self.as_slice() == other.as_ref()

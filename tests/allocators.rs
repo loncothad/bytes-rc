@@ -450,3 +450,40 @@ fn panicking_owner_borrow_and_drop_release_control_allocations() {
     assert!(catch_unwind(AssertUnwindSafe(|| drop(bytes))).is_err());
     state.assert_empty();
 }
+
+#[test]
+fn content_equality_is_independent_of_allocator_type() {
+    fn compare<L: PartialEq<R> + std::fmt::Debug, R: PartialEq<L> + std::fmt::Debug>(left: &L, right: &R) {
+        assert!(left == right, "{left:?} != {right:?}");
+        assert!(right == left, "{right:?} != {left:?}");
+    }
+
+    let state = Rc::new(State::default());
+    let allocator = NonClone(state.allocator());
+    let immutable = Bytes::copy_from_slice_in(b"abc", state.allocator());
+    let borrowed_immutable = Bytes::copy_from_slice_in(b"abc", &allocator);
+    let global_immutable = Bytes::copy_from_slice(b"abc");
+    let mutable = BytesMut::copy_from_slice_in(b"abc", NonClone(state.allocator()));
+    let global_mutable = BytesMut::from(b"abc".as_slice());
+    let mut vec = Vec::new_in(&allocator);
+    vec.extend_from_slice(b"abc");
+    let global_vec = b"abc".to_vec();
+
+    compare(&immutable, &borrowed_immutable);
+    compare(&immutable, &global_immutable);
+    compare(&immutable, &mutable);
+    compare(&immutable, &global_mutable);
+    compare(&borrowed_immutable, &global_immutable);
+    compare(&borrowed_immutable, &mutable);
+    compare(&mutable, &global_mutable);
+    compare(&immutable, &vec);
+    compare(&global_immutable, &vec);
+    compare(&mutable, &vec);
+    compare(&global_mutable, &vec);
+    compare(&immutable, &global_vec);
+    compare(&mutable, &global_vec);
+    assert_ne!(immutable, Bytes::from_static(b"different"));
+    assert_ne!(mutable, BytesMut::from(b"different".as_slice()));
+    drop((immutable, borrowed_immutable, mutable, vec));
+    state.assert_empty();
+}
