@@ -37,6 +37,21 @@
 //! fn require_send<T: Send>() {}
 //! require_send::<bytes_rc::Bytes>();
 //! ```
+//!
+//! ```compile_fail
+//! fn require_send<T: Send>() {}
+//! require_send::<bytes_rc::BytesMut>();
+//! ```
+//!
+//! ```compile_fail
+//! fn require_sync<T: Sync>() {}
+//! require_sync::<bytes_rc::Bytes>();
+//! ```
+//!
+//! ```compile_fail
+//! fn require_sync<T: Sync>() {}
+//! require_sync::<bytes_rc::BytesMut>();
+//! ```
 
 #![deny(missing_docs)]
 
@@ -706,7 +721,8 @@ impl BytesMut {
         };
 
         if self.data.is_null() {
-            // Cannot easily reclaim without `SharedData` because we don't know original ptr
+            // Cannot easily reclaim without `SharedData` because we don't know
+            // original ptr
             false
         } else {
             // SAFETY: non-null `data` points to the live shared allocation.
@@ -1919,9 +1935,9 @@ mod tests {
     fn bytes_mut_reserve_shared() {
         let mut b1 = BytesMut::with_capacity(10);
         b1.put_slice(b"hello");
-        let b2 = b1.clone(); // triggers promotion/sharing
+        let b2 = b1.clone(); // creates an independent allocation
 
-        b1.reserve(20); // should reallocate independently since it is shared
+        b1.reserve(20); // growing the original must preserve its deep clone
         b1.put_slice(b" world");
 
         assert_eq!(b1.as_ref(), b"hello world");
@@ -1955,12 +1971,13 @@ mod tests {
         b.put_slice(b"abc");
         assert_eq!(b.as_ref(), b"abc");
 
-        // SAFETY: the test is deliberately marking two spare bytes initialized;
-        // their values are not subsequently read.
+        b.chunk_mut()[.. 2].copy_from_slice(b"de");
+        // SAFETY: the two spare bytes were initialized above.
         unsafe {
             b.advance_mut(2); // directly advance length
         }
         assert_eq!(b.len(), 5);
+        assert_eq!(b.as_ref(), b"abcde");
     }
 
     #[test]
@@ -2122,9 +2139,9 @@ mod tests {
         let mut b1 = BytesMut::with_capacity(10);
         b1.put_slice(b"abc");
 
-        let mut b2 = b1.clone(); // both point to same shared data internally
+        let mut b2 = b1.clone(); // owns a deep copy of the initialized bytes
 
-        // Write to b1, triggering copy-on-write (detaching from b2)
+        // Mutating the original must leave its independent clone unchanged.
         b1.put_slice(b"def");
 
         assert_eq!(b1.as_ref(), b"abcdef");
